@@ -59,6 +59,14 @@ import { prepareCursorSandboxCommand } from "./remote-command.js";
 import { normalizeCursorStreamLine } from "../shared/stream.js";
 import { hasCursorTrustBypassArg } from "../shared/trust.js";
 import { resolveCursorSkillsHome } from "./skills.js";
+import {
+  ensureApproveMcpsArg,
+  managedMcpGatewaysFromContext,
+  mergeManagedCursorMcpGateways,
+  restoreManagedCursorMcpConfig,
+  writeManagedCursorMcpConfig,
+  type ManagedCursorMcpSnapshot,
+} from "./managed-mcp.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -339,16 +347,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   command = initialSandboxCommand.command;
   env = initialSandboxCommand.env;
 
-  const extraArgs = (() => {
+  const configuredExtraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
     if (fromExtraArgs.length > 0) return fromExtraArgs;
     return asStringArray(config.args);
   })();
+  let extraArgs = configuredExtraArgs;
   const autoTrustEnabled = !hasCursorTrustBypassArg(extraArgs);
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
   let localSkillsDir: string | null = null;
   let remoteRuntimeRootDir: string | null = null;
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let managedMcpSnapshot: ManagedCursorMcpSnapshot | null = null;
 
   if (executionTargetIsRemote) {
     try {
@@ -437,6 +447,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env = finalSandboxCommand.env;
   }
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
+
+  const paperclipBaseEnv = buildPaperclipEnv(agent, ctx.agentIdentity);
+  const runtimeMcpGateways = (ctx.runtimeMcp?.getServers() ?? []).map((server) => ({
+    name: server.name,
+    endpointPath: server.url,
+    bearerToken: server.token,
+  }));
+  const managedMcpGateways = mergeManagedCursorMcpGateways(
+    runtimeMcpGateways,
+    managedMcpGatewaysFromContext(context),
+  );
+  if (managedMcpGateways.length > 0) {
+    managedMcpSnapshot = await writeManagedCursorMcpConfig({
+      workspaceCwd: effectiveExecutionCwd,
+      apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
+      gateways: managedMcpGateways,
+      executionTarget,
+      runId,
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+    });
+    extraArgs = ensureApproveMcpsArg(extraArgs, true);
+    if (managedMcpSnapshot) {
+      await onLog(
+        "stdout",
+        `[paperclip] Wrote ${managedMcpSnapshot.serverNames.length} managed MCP gateway(s) into Cursor config "${managedMcpSnapshot.configPath}".\n`,
+      );
+      for (const warning of managedMcpSnapshot.warnings) {
+        await onLog("stderr", `[paperclip] ${warning}\n`);
+      }
+    }
+  }
+
   const effectiveEnv = Object.fromEntries(
     Object.entries({ ...process.env, ...env }).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -807,6 +852,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       await providerStop.collectBeforeRestore();
     } finally {
+      try {
+        await restoreManagedCursorMcpConfig({
+          snapshot: managedMcpSnapshot,
+          executionTarget,
+          runId,
+          cwd,
+          env,
+          timeoutSec,
+          graceSec,
+        });
+      } catch (error) {
+        await onLog(
+          "stderr",
+          `[paperclip] Failed to restore Cursor MCP config: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
       if (paperclipBridge) {
         await paperclipBridge.stop();
       }
