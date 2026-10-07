@@ -459,8 +459,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     managedMcpGatewaysFromContext(context),
   );
   if (managedMcpGateways.length > 0) {
+    // Prefer HOME/.cursor/mcp.json (Codex writes CODEX_HOME). Workspace
+    // `.cursor/` participates in SSH workspace restore and can EACCES when the
+    // Paperclip host user lacks write on nested run dirs.
+    let cursorHomeForMcp = typeof env.HOME === "string" ? env.HOME.trim() : "";
+    if (executionTargetIsRemote && !cursorHomeForMcp) {
+      // Do not use the Paperclip host homedir for remote agents.
+      cursorHomeForMcp =
+        (await readAdapterExecutionTargetHomeDir(runId, executionTarget, {
+          cwd,
+          env,
+          timeoutSec,
+          graceSec,
+        })) ?? "";
+    }
+    if (!cursorHomeForMcp) {
+      cursorHomeForMcp = os.homedir();
+    }
     managedMcpSnapshot = await writeManagedCursorMcpConfig({
-      workspaceCwd: effectiveExecutionCwd,
+      cursorHome: cursorHomeForMcp,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
       executionTarget,

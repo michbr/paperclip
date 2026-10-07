@@ -50,7 +50,7 @@ describe("managed cursor mcp config", () => {
     expect(warnings[0]).toContain("overlapping");
   });
 
-  it("writes and restores workspace mcp.json locally", async () => {
+  it("writes and restores home mcp.json locally", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-mcp-"));
     try {
       const existingPath = path.join(root, ".cursor", "mcp.json");
@@ -62,7 +62,7 @@ describe("managed cursor mcp config", () => {
       );
 
       const snapshot = await writeManagedCursorMcpConfig({
-        workspaceCwd: root,
+        cursorHome: root,
         apiBaseUrl: "http://127.0.0.1:3100",
         gateways: [{ name: "paperclip-assigned", endpointPath: "/mcp/gateways/x", bearerToken: "run-token" }],
         executionTarget: null,
@@ -106,7 +106,7 @@ describe("managed cursor mcp config", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-mcp-"));
     try {
       const snapshot = await writeManagedCursorMcpConfig({
-        workspaceCwd: root,
+        cursorHome: root,
         apiBaseUrl: "http://127.0.0.1:3100",
         gateways: [{ name: "gw", endpointPath: "/mcp/g", bearerToken: "t" }],
         executionTarget: null,

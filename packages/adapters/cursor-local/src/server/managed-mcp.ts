@@ -120,12 +120,13 @@ export function buildManagedCursorMcpServers(input: {
   return { servers, warnings, names };
 }
 
-export function resolveCursorWorkspaceMcpConfigPath(workspaceCwd: string): string {
-  return path.join(workspaceCwd, ".cursor", "mcp.json");
+/** Cursor loads project + user MCP config; Paperclip writes the user config under HOME. */
+export function resolveCursorHomeMcpConfigPath(cursorHome: string): string {
+  return path.join(cursorHome, ".cursor", "mcp.json");
 }
 
-export function resolveCursorWorkspaceMcpConfigPathPosix(workspaceCwd: string): string {
-  return path.posix.join(workspaceCwd.replace(/\\/g, "/"), ".cursor", "mcp.json");
+export function resolveCursorHomeMcpConfigPathPosix(cursorHome: string): string {
+  return path.posix.join(cursorHome.replace(/\\/g, "/"), ".cursor", "mcp.json");
 }
 
 async function readLocalTextFile(filePath: string): Promise<string | null> {
@@ -226,7 +227,8 @@ async function removeRemoteTextFile(input: {
 }
 
 export async function writeManagedCursorMcpConfig(input: {
-  workspaceCwd: string;
+  /** Absolute HOME (or managed Cursor home) where `.cursor/mcp.json` should be written. */
+  cursorHome: string;
   apiBaseUrl: string;
   gateways: ManagedCursorMcpGateway[];
   executionTarget: AdapterExecutionTarget | null | undefined;
@@ -238,10 +240,15 @@ export async function writeManagedCursorMcpConfig(input: {
 }): Promise<ManagedCursorMcpSnapshot | null> {
   if (input.gateways.length === 0) return null;
 
+  const cursorHome = input.cursorHome.trim();
+  if (!cursorHome) {
+    throw new Error("cursorHome is required to write managed Cursor MCP config");
+  }
+
   const isRemote = input.executionTarget?.kind === "remote";
   const configPath = isRemote
-    ? resolveCursorWorkspaceMcpConfigPathPosix(input.workspaceCwd)
-    : resolveCursorWorkspaceMcpConfigPath(input.workspaceCwd);
+    ? resolveCursorHomeMcpConfigPathPosix(cursorHome)
+    : resolveCursorHomeMcpConfigPath(cursorHome);
 
   const previousContents = isRemote
     ? await readRemoteTextFile({
