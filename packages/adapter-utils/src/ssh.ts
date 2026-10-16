@@ -422,6 +422,34 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * Build a NUL-terminated top-level entry list for `tar --null -T` so the archive
+ * never embeds a `./` self-entry. Archiving `.` makes extract restore the source
+ * directory mode onto the destination; on ACL-shared workspaces that collapses
+ * the ACL mask (e.g. `user:host:rwx` → effective `r-x`) and breaks later
+ * host-side sync-back writes with EACCES.
+ */
+async function withLocalTarEntryList<T>(
+  localDir: string,
+  fn: (listPath: string) => Promise<T>,
+): Promise<T> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-list-"));
+  const listPath = path.join(directory, "entries.nul");
+  try {
+    const file = await fs.open(listPath, "wx", 0o600);
+    try {
+      for await (const entry of await fs.opendir(localDir)) {
+        await file.writeFile(`${entry.name}\0`);
+      }
+    } finally {
+      await file.close();
+    }
+    return await fn(listPath);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
 // We only need approximate fidelity here (the estimate feeds a clamped percent),
 // so we support the literal names and `*`/`?` globs used in practice.
@@ -1437,83 +1465,88 @@ export async function syncDirectoryToSsh(input: {
     : null;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-    const tarArgs = [
-      ...(input.followSymlinks ? ["-h"] : []),
-      "-C",
-      input.localDir,
-      ...tarExcludeArgs(input.exclude),
-      "-cf",
-      "-",
-      ".",
-    ];
-    const tar = spawn("tar", tarArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: tarSpawnEnv(),
-    });
-    const ssh = spawn("ssh", sshArgs, {
-      stdio: ["pipe", "ignore", "pipe"],
-    });
+    await withLocalTarEntryList(input.localDir, async (entryListPath) => {
+      await new Promise<void>((resolve, reject) => {
+        // Entry names instead of "." — see withLocalTarEntryList.
+        const tarArgs = [
+          ...(input.followSymlinks ? ["-h"] : []),
+          "-C",
+          input.localDir,
+          ...tarExcludeArgs(input.exclude),
+          "-cf",
+          "-",
+          "--null",
+          "-T",
+          entryListPath,
+        ];
+        const tar = spawn("tar", tarArgs, {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: tarSpawnEnv(),
+        });
+        const ssh = spawn("ssh", sshArgs, {
+          stdio: ["pipe", "ignore", "pipe"],
+        });
 
-    let tarStderr = "";
-    let sshStderr = "";
-    let settled = false;
-    let tarExited = false;
-    let sshExited = false;
-    let tarExitCode: number | null = null;
-    let sshExitCode: number | null = null;
+        let tarStderr = "";
+        let sshStderr = "";
+        let settled = false;
+        let tarExited = false;
+        let sshExited = false;
+        let tarExitCode: number | null = null;
+        let sshExitCode: number | null = null;
 
-    const maybeFinish = () => {
-      if (settled || !tarExited || !sshExited) {
-        return;
-      }
-      settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
-        reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
-        return;
-      }
-      if ((sshExitCode ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
-        return;
-      }
-      resolve();
-    };
+        const maybeFinish = () => {
+          if (settled || !tarExited || !sshExited) {
+            return;
+          }
+          settled = true;
+          if ((tarExitCode ?? 0) !== 0) {
+            reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
+            return;
+          }
+          if ((sshExitCode ?? 0) !== 0) {
+            reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
+            return;
+          }
+          resolve();
+        };
 
-    const fail = (error: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      tar.kill("SIGTERM");
-      ssh.kill("SIGTERM");
-      reject(error);
-    };
+        const fail = (error: Error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          tar.kill("SIGTERM");
+          ssh.kill("SIGTERM");
+          reject(error);
+        };
 
-    if (progress) {
-      progress.counter.on("error", fail);
-      tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
-    } else {
-      tar.stdout?.pipe(ssh.stdin ?? null);
-    }
-    tar.stderr?.on("data", (chunk) => {
-      tarStderr += String(chunk);
-    });
-    ssh.stderr?.on("data", (chunk) => {
-      sshStderr += String(chunk);
-    });
+        if (progress) {
+          progress.counter.on("error", fail);
+          tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
+        } else {
+          tar.stdout?.pipe(ssh.stdin ?? null);
+        }
+        tar.stderr?.on("data", (chunk) => {
+          tarStderr += String(chunk);
+        });
+        ssh.stderr?.on("data", (chunk) => {
+          sshStderr += String(chunk);
+        });
 
-    tar.on("error", fail);
-    ssh.on("error", fail);
-    tar.on("close", (code) => {
-      tarExited = true;
-      tarExitCode = code;
-      maybeFinish();
-    });
-    ssh.on("close", (code) => {
-      sshExited = true;
-      sshExitCode = code;
-      maybeFinish();
-    });
+        tar.on("error", fail);
+        ssh.on("error", fail);
+        tar.on("close", (code) => {
+          tarExited = true;
+          tarExitCode = code;
+          maybeFinish();
+        });
+        ssh.on("close", (code) => {
+          sshExited = true;
+          sshExitCode = code;
+          maybeFinish();
+        });
+      });
     }).finally(auth.cleanup);
     await progress?.finish();
   } catch (error) {
@@ -1533,9 +1566,18 @@ export async function syncDirectoryFromSsh(input: {
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  // Top-level entries only (no "."): same ACL-mask hazard as syncDirectoryToSsh
+  // when the extract target is a shared host path on localhost SSH.
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    `find . -mindepth 1 -maxdepth 1 -print0 | tar ${[
+      ...tarExcludeArgs(input.exclude).map(shellQuote),
+      "--null",
+      "-T",
+      "-",
+      "-cf",
+      "-",
+    ].join(" ")}`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,

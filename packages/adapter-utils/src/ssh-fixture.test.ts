@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -552,6 +552,41 @@ describe("ssh env-lab fixture", () => {
 
     expect(result.stdout).toContain("hello from paperclip");
     expect(result.stdout).not.toContain("appledouble-present");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("does not restore the local directory mode onto the remote extract target", async () => {
+    // Archiving "." embeds a ./ self-entry; extract then chmod's the remote
+    // destination to match the local dir mode. On ACL-shared host paths that
+    // collapses the ACL mask and breaks later host sync-back with EACCES.
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-overlay-mode");
+
+    await mkdir(localDir, { recursive: true });
+    await writeFile(path.join(localDir, "payload.txt"), "mode-preserve\n", "utf8");
+    await chmod(localDir, 0o755);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH tar mode preserve test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const remoteDir = path.posix.join(started.workspaceDir, "overlay-mode");
+
+    await runSshCommand(config, `mkdir -p ${JSON.stringify(remoteDir)} && chmod 770 ${JSON.stringify(remoteDir)}`);
+    const before = await runSshCommand(config, `stat -c %a ${JSON.stringify(remoteDir)}`);
+    expect(before.stdout.trim()).toBe("770");
+
+    await syncDirectoryToSsh({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      localDir,
+      remoteDir,
+    });
+
+    const after = await runSshCommand(
+      config,
+      `stat -c %a ${JSON.stringify(remoteDir)} && cat ${JSON.stringify(path.posix.join(remoteDir, "payload.txt"))}`,
+    );
+    expect(after.stdout).toContain("mode-preserve");
+    expect(after.stdout.trim().split("\n")[0]).toBe("770");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports throttled upload progress with a clamped percent and terminal 100% line", async () => {
